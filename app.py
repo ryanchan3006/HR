@@ -51,6 +51,9 @@ FONT_H    = ("Segoe UI", 12, "bold")
 PLACEHOLDER_RE = re.compile(r"\{\{(.+?)\}\}")
 BUILTIN_TEMPLATE_FIELDS = ["Issuance Date"]
 CONTRACT_OUTPUT_FOLDER = "Contract Generated"
+NAME_FIELD_KEYS = {"full name", "candidate name", "name"}
+BOLD_FIELD_KEYS = NAME_FIELD_KEYS | {"title", "job title", "joining date", "start date", "salary"}
+SALARY_FIELD_KEYS = {"salary"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
@@ -214,6 +217,18 @@ def resolve_contract_output_dir(path):
         return raw
     return os.path.join(raw, CONTRACT_OUTPUT_FOLDER)
 
+
+def is_candidate_name_field(name):
+    return str(name or "").strip().casefold() in NAME_FIELD_KEYS
+
+
+def is_bold_insert_field(name):
+    return str(name or "").strip().casefold() in BOLD_FIELD_KEYS
+
+
+def is_salary_field(name):
+    return str(name or "").strip().casefold() in SALARY_FIELD_KEYS
+
 def _find_candidate_sheet(workbook):
     for sheet in workbook.worksheets:
         name = sheet.title.lower().strip()
@@ -273,11 +288,61 @@ def normalize_rank(value):
 
 
 def _set_paragraph_text(paragraph, text):
+    if paragraph.text == text:
+        return
     if paragraph.runs:
         for i, run in enumerate(paragraph.runs):
             run.text = text if i == 0 else ""
     else:
         paragraph.add_run(text)
+
+
+def _copy_run_format(source_run, target_run):
+    target_run.style = source_run.style
+    target_run.bold = source_run.bold
+    target_run.italic = source_run.italic
+    target_run.underline = source_run.underline
+
+    target_font = target_run.font
+    source_font = source_run.font
+    target_font.name = source_font.name
+    target_font.size = source_font.size
+    target_font.bold = source_font.bold
+    target_font.italic = source_font.italic
+    target_font.underline = source_font.underline
+
+
+def _apply_insert_field_format(run, field_name):
+    make_bold = is_bold_insert_field(field_name)
+    run.style = None
+    run.bold = make_bold
+    run.italic = False
+    run.underline = False
+    run.font.name = "Aptos"
+    run.font.size = Pt(12)
+    run.font.bold = make_bold
+    run.font.italic = False
+    run.font.underline = False
+
+
+def _clear_paragraph_runs(paragraph):
+    for run in list(paragraph.runs):
+        paragraph._p.remove(run._element)
+
+
+def _slice_plain_segments(full_text, start, end, run_spans):
+    if start >= end:
+        return []
+    if not run_spans:
+        return [(full_text[start:end], None)]
+
+    pieces = []
+    for run, run_start, run_end in run_spans:
+        seg_start = max(start, run_start)
+        seg_end = min(end, run_end)
+        if seg_start < seg_end:
+            pieces.append((full_text[seg_start:seg_end], run))
+    return pieces or [(full_text[start:end], None)]
 
 
 def read_docx_plain_text(docx_path):
@@ -286,7 +351,7 @@ def read_docx_plain_text(docx_path):
 
 
 def save_docx_plain_text(docx_path, text):
-    """Write edited plain-text lines back into an existing docx's paragraphs."""
+    """Write edited plain-text lines back into an existing docx while preserving untouched paragraphs."""
     doc = Document(docx_path)
     lines = text.split("\n")
     paragraphs = list(doc.paragraphs)
@@ -298,7 +363,8 @@ def save_docx_plain_text(docx_path, text):
             doc.add_paragraph(line)
 
     for paragraph in paragraphs[len(lines):]:
-        _set_paragraph_text(paragraph, "")
+        if paragraph.text:
+            _set_paragraph_text(paragraph, "")
 
     doc.save(docx_path)
 
@@ -376,15 +442,53 @@ def fill_template(docx_path, replacements, out_path):
         full = para.text
         if "{{" not in full:
             return
-        new_text = PLACEHOLDER_RE.sub(
-            lambda m: replacements.get(m.group(1).strip(), m.group(0)),
-            full,
-        )
-        if new_text == full:
+        matches = list(PLACEHOLDER_RE.finditer(full))
+        if not matches:
             return
-        # Clear runs and put everything in first run
-        for i, run in enumerate(para.runs):
-            run.text = new_text if i == 0 else ""
+        run_spans = []
+        cursor = 0
+        for run in para.runs:
+            start = cursor
+            end = start + len(run.text)
+            run_spans.append((run, start, end))
+            cursor = end
+
+        pieces = []
+        cursor = 0
+        for match in matches:
+            start, end = match.span()
+            if cursor < start:
+                for text, source_run in _slice_plain_segments(full, cursor, start, run_spans):
+                    if text:
+                        pieces.append(("plain", text, source_run, None))
+
+            field_name = match.group(1).strip()
+            replacement = str(replacements.get(field_name, match.group(0)))
+            if replacement and is_salary_field(field_name) and pieces:
+                prev_kind, prev_text, prev_source_run, prev_field_name = pieces[-1]
+                if prev_kind == "plain" and prev_text.endswith("S$"):
+                    prev_text = prev_text[:-2]
+                    if prev_text:
+                        pieces[-1] = (prev_kind, prev_text, prev_source_run, prev_field_name)
+                    else:
+                        pieces.pop()
+                    replacement = f"S${replacement}"
+            if replacement:
+                pieces.append(("field", replacement, None, field_name))
+            cursor = end
+
+        if cursor < len(full):
+            for text, source_run in _slice_plain_segments(full, cursor, len(full), run_spans):
+                if text:
+                    pieces.append(("plain", text, source_run, None))
+
+        _clear_paragraph_runs(para)
+        for kind, text, source_run, field_name in pieces:
+            run = para.add_run(text)
+            if kind == "plain" and source_run is not None:
+                _copy_run_format(source_run, run)
+            elif kind == "field":
+                _apply_insert_field_format(run, field_name)
 
     for para in doc.paragraphs:
         replace_in_para(para)
@@ -929,10 +1033,7 @@ class TemplateTab(tk.Frame):
     def _finish_save(self):
         try:
             content = self.editor.get("1.0", "end-1c")
-            doc = Document()
-            for line in content.split("\n"):
-                doc.add_paragraph(line)
-            doc.save(self.tmpl_path)
+            save_docx_plain_text(self.tmpl_path, content)
         except Exception as exc:
             self.app.switch_tab(1)
             self.app.update_idletasks()
