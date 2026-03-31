@@ -7,7 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 # ── third-party (pip install python-docx openpyxl) ──────────────────────────
@@ -54,6 +54,7 @@ CONTRACT_OUTPUT_FOLDER = "Contract Generated"
 NAME_FIELD_KEYS = {"full name", "candidate name", "name"}
 BOLD_FIELD_KEYS = NAME_FIELD_KEYS | {"title", "job title", "joining date", "start date", "salary"}
 SALARY_FIELD_KEYS = {"salary"}
+DATE_ONLY_FIELD_KEYS = {"joining date", "start date"}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
@@ -229,6 +230,29 @@ def is_bold_insert_field(name):
 def is_salary_field(name):
     return str(name or "").strip().casefold() in SALARY_FIELD_KEYS
 
+
+def is_date_only_field(name):
+    return str(name or "").strip().casefold() in DATE_ONLY_FIELD_KEYS
+
+
+def _format_excel_value(header, value):
+    if value is None:
+        return ""
+
+    if is_date_only_field(header):
+        if isinstance(value, datetime):
+            value = value.date()
+        if isinstance(value, date):
+            return f"{value.day} {value.strftime('%B %Y')}"
+
+        text = str(value).strip()
+        if not text:
+            return ""
+        text = re.sub(r"(?:[T\s]+00:00(?::00(?:\.0+)?)?)$", "", text)
+        return text
+
+    return str(value).strip()
+
 def _find_candidate_sheet(workbook):
     for sheet in workbook.worksheets:
         name = sheet.title.lower().strip()
@@ -395,7 +419,7 @@ def read_excel(path):
     for row in b_sheet.iter_rows(min_row=2, values_only=True):
         if all(v is None for v in row):
             continue
-        candidates.append({headers[i]: (str(v).strip() if v is not None else "") for i, v in enumerate(row)})
+        candidates.append({headers[i]: _format_excel_value(headers[i], v) for i, v in enumerate(row)})
 
     # Annex C — signatory mapping
     c_sheet = _find_signatory_sheet(wb)
@@ -406,7 +430,7 @@ def read_excel(path):
         for row in c_sheet.iter_rows(min_row=2, values_only=True):
             if all(v is None for v in row):
                 continue
-            rd = {c_hdrs[i]: (str(v).strip() if v is not None else "") for i, v in enumerate(row)}
+            rd = {c_hdrs[i]: _format_excel_value(c_hdrs[i], v) for i, v in enumerate(row)}
             raw_rank = rd.get("Rank") or rd.get("rank") or list(rd.values())[0]
             rank_key = normalize_rank(raw_rank)
             if not rank_key:
