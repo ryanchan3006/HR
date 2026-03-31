@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # ── third-party (pip install python-docx openpyxl) ──────────────────────────
@@ -48,6 +49,8 @@ FONT_BOLD = ("Segoe UI", 10, "bold")
 FONT_H    = ("Segoe UI", 12, "bold")
 
 PLACEHOLDER_RE = re.compile(r"\{\{(.+?)\}\}")
+BUILTIN_TEMPLATE_FIELDS = ["Issuance Date"]
+CONTRACT_OUTPUT_FOLDER = "Contract Generated"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
@@ -185,6 +188,32 @@ def _sheet_headers(sheet):
 
     return [str(cell.value).strip() if cell.value else "" for cell in first_row]
 
+
+def build_template_fields(extra_fields=None):
+    ordered = []
+    seen = set()
+    for field in [*BUILTIN_TEMPLATE_FIELDS, *(extra_fields or [])]:
+        name = str(field or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def current_issuance_date():
+    now = datetime.now()
+    return f"{now.day} {now.strftime('%B %Y')}"
+
+
+def resolve_contract_output_dir(path):
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    if os.path.basename(os.path.normpath(raw)).casefold() == CONTRACT_OUTPUT_FOLDER.casefold():
+        return raw
+    return os.path.join(raw, CONTRACT_OUTPUT_FOLDER)
+
 def _find_candidate_sheet(workbook):
     for sheet in workbook.worksheets:
         name = sheet.title.lower().strip()
@@ -213,7 +242,7 @@ def extract_excel_fields(path):
             if header not in seen:
                 seen.add(header)
                 ordered.append(header)
-        return ordered
+        return build_template_fields(ordered)
     finally:
         wb.close()
 
@@ -471,8 +500,8 @@ class GenerateTab(tk.Frame):
         pad = dict(padx=20, pady=8)
 
         tk.Label(self, text="Contract Generator", font=FONT_H, bg=BG, fg=TEXT
-                 ).pack(anchor="w", padx=20, pady=(18, 2))
-        tk.Label(self, text="Select your data file and output folder, then generate. Edit the template only if you need to adjust the wording.",
+                 ).pack(anchor="w", padx=20, pady=(10, 2))
+        tk.Label(self, text="Select your data file and base output folder, then generate. Contracts are saved into 'Contract Generated'. Edit the template only if you need to adjust the wording.",
                  font=FONT_SM, bg=BG, fg=MUTED).pack(anchor="w", padx=20, pady=(0, 10))
 
         self.excel_picker = FilePicker(self, "Excel data file (Annex B & C)",
@@ -495,7 +524,7 @@ class GenerateTab(tk.Frame):
                   activeforeground=TEXT, padx=10, pady=4, cursor="hand2",
                   command=self._edit_template).pack(side="left", padx=(8, 0))
 
-        self.output_picker = FilePicker(self, "Output folder", mode="dir")
+        self.output_picker = FilePicker(self, "Output base folder", mode="dir")
         self.output_picker.pack(fill="x", **pad)
 
         # Divider
@@ -565,12 +594,12 @@ class GenerateTab(tk.Frame):
 
     def _excel_changed(self, path):
         self.app.excel_path = path
-        fields = []
+        fields = build_template_fields()
         if path and os.path.exists(path):
             try:
                 fields = extract_excel_fields(path)
             except Exception:
-                fields = []
+                fields = build_template_fields()
         self.app.available_fields = fields
 
         template_tab = getattr(self.app, "template_tab", None)
@@ -613,7 +642,9 @@ class GenerateTab(tk.Frame):
             messagebox.showerror("Error", "Please select an output folder.")
             return
 
+        out_dir = resolve_contract_output_dir(out_dir)
         os.makedirs(out_dir, exist_ok=True)
+        self.output_picker.set(out_dir)
         self.app.template_path = tmpl
         self.app.output_dir    = out_dir
         self.gen_btn.configure(state="disabled")
@@ -659,6 +690,7 @@ class GenerateTab(tk.Frame):
                 replacements = dict(cand)
                 rank = cand.get("Rank") or cand.get("rank") or ""
                 replacements.update(signatories[normalize_rank(rank)])
+                replacements["Issuance Date"] = current_issuance_date()
 
                 # Write filled docx to temp location
                 safe_name = re.sub(r'[\\/*?:"<>|]', "_", name)
@@ -781,7 +813,7 @@ class TemplateTab(tk.Frame):
         self.field_frame = tk.Frame(right, bg=BG)
         self.field_frame.pack(fill="x")
 
-        hint = tk.Label(right, text="Fields come from your\nExcel column headers.",
+        hint = tk.Label(right, text="Fields come from Excel\nheaders plus built-ins\nlike Issuance Date.",
                         font=("Segoe UI", 8), bg=BG, fg=MUTED, justify="left")
         hint.pack(anchor="w", pady=(12, 0))
 
@@ -820,7 +852,7 @@ class TemplateTab(tk.Frame):
         self._refresh_fields()
 
     def set_available_fields(self, fields):
-        self.available_fields = fields or []
+        self.available_fields = build_template_fields(fields)
         self._refresh_fields()
 
     def _refresh_fields(self):
@@ -829,7 +861,7 @@ class TemplateTab(tk.Frame):
 
         fields = self.available_fields or self.app.available_fields
         if not fields:
-            tk.Label(self.field_frame, text="Select an Excel file\nto load fields.",
+            tk.Label(self.field_frame, text="No fields available.",
                      font=("Segoe UI", 8), bg=BG, fg=MUTED, justify="left").pack(anchor="w")
             return
         for f in fields:
@@ -1371,9 +1403,15 @@ class ReviewTab(tk.Frame):
     def _export(self):
         out_dir = self.app.output_dir
         if not out_dir:
-            out_dir = filedialog.askdirectory(title="Select export folder")
-            if not out_dir:
+            chosen_dir = filedialog.askdirectory(title="Select export folder")
+            if not chosen_dir:
                 return
+            out_dir = resolve_contract_output_dir(chosen_dir)
+            os.makedirs(out_dir, exist_ok=True)
+            self.app.output_dir = out_dir
+            generate_tab = getattr(self.app, "generate_tab", None)
+            if generate_tab:
+                generate_tab.output_picker.set(out_dir)
 
         approved = [c for c in (self.app.contracts or []) if c["status"] == "approved"]
         if not approved:
@@ -1585,7 +1623,7 @@ class App(tk.Tk):
         self.excel_path    = ""
         self.template_path = ""
         self.output_dir    = ""
-        self.available_fields = []
+        self.available_fields = build_template_fields()
         self.last_export_dir = ""
 
         self._build()
@@ -1683,10 +1721,10 @@ class App(tk.Tk):
         self.contracts = []
         self.excel_path = ""
         self.output_dir = ""
-        self.available_fields = []
+        self.available_fields = build_template_fields()
         self.template_path = ""
         self.generate_tab.reset_form()
-        self.template_tab.set_available_fields([])
+        self.template_tab.set_available_fields(self.available_fields)
         self.review_tab.reset_view()
 
     def start_new_batch(self):
