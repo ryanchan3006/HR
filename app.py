@@ -55,6 +55,8 @@ NAME_FIELD_KEYS = {"full name", "candidate name", "name"}
 BOLD_FIELD_KEYS = NAME_FIELD_KEYS | {"title", "job title", "joining date", "start date", "salary"}
 SALARY_FIELD_KEYS = {"salary"}
 DATE_ONLY_FIELD_KEYS = {"joining date", "start date"}
+DEFAULT_TEMPLATE_NAME = "Workflow Automation template.docx"
+APP_DATA_DIR_NAME = "Contract Generator"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Helpers
@@ -219,6 +221,50 @@ def resolve_contract_output_dir(path):
     return os.path.join(raw, CONTRACT_OUTPUT_FOLDER)
 
 
+def app_resource_dir():
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+
+def app_runtime_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def app_user_data_dir():
+    return Path.home() / "Documents" / APP_DATA_DIR_NAME
+
+
+def _ensure_writable_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / ".write_test"
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink()
+    return path
+
+
+def writable_template_dir():
+    for candidate in (app_runtime_dir(), app_user_data_dir()):
+        try:
+            return _ensure_writable_dir(candidate)
+        except Exception:
+            continue
+    return app_runtime_dir()
+
+
+def ensure_bundled_default_template():
+    resource_path = app_resource_dir() / DEFAULT_TEMPLATE_NAME
+    if not resource_path.exists():
+        return ""
+
+    target_path = writable_template_dir() / DEFAULT_TEMPLATE_NAME
+    if not target_path.exists():
+        shutil.copy2(resource_path, target_path)
+    return str(target_path)
+
+
 def is_candidate_name_field(name):
     return str(name or "").strip().casefold() in NAME_FIELD_KEYS
 
@@ -288,7 +334,13 @@ def extract_excel_fields(path):
 
 def find_default_template(base_dir=None):
     """Prefer a local .docx with 'template' in the filename, else the only .docx file."""
-    root = Path(base_dir or Path(__file__).resolve().parent)
+    if base_dir is None:
+        bundled = ensure_bundled_default_template()
+        if bundled:
+            return bundled
+        root = app_runtime_dir()
+    else:
+        root = Path(base_dir)
     docx_files = sorted(root.glob("*.docx"))
     if not docx_files:
         return ""
@@ -526,7 +578,62 @@ def fill_template(docx_path, replacements, out_path):
 
 
 def docx_to_pdf(docx_path, out_dir):
-    """Convert docx → pdf using LibreOffice (must be installed)."""
+    """Convert docx -> pdf using Microsoft Word on Windows, else LibreOffice."""
+    errors = []
+    if sys.platform.startswith("win"):
+        try:
+            return docx_to_pdf_via_word(docx_path, out_dir)
+        except Exception as exc:
+            errors.append(f"Microsoft Word: {exc}")
+
+    try:
+        return docx_to_pdf_via_libreoffice(docx_path, out_dir)
+    except Exception as exc:
+        errors.append(f"LibreOffice: {exc}")
+
+    raise RuntimeError(" | ".join(errors) or "PDF conversion failed")
+
+
+def docx_to_pdf_via_word(docx_path, out_dir):
+    """Convert docx -> pdf using Microsoft Word automation on Windows."""
+    if not sys.platform.startswith("win"):
+        raise RuntimeError("Microsoft Word PDF conversion is only available on Windows.")
+
+    stem = Path(docx_path).stem
+    pdf = Path(out_dir) / f"{stem}.pdf"
+    if pdf.exists():
+        pdf.unlink()
+
+    docx_escaped = str(Path(docx_path).resolve()).replace("'", "''")
+    pdf_escaped = str(pdf.resolve()).replace("'", "''")
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        f"$docxPath = '{docx_escaped}'; "
+        f"$pdfPath = '{pdf_escaped}'; "
+        "$word = $null; "
+        "$doc = $null; "
+        "try { "
+        "  $word = New-Object -ComObject Word.Application; "
+        "  $word.Visible = $false; "
+        "  $word.DisplayAlerts = 0; "
+        "  $doc = $word.Documents.Open($docxPath, $false, $true); "
+        "  $doc.ExportAsFixedFormat($pdfPath, 17); "
+        "} finally { "
+        "  if ($doc -ne $null) { $doc.Close([ref]$false) } "
+        "  if ($word -ne $null) { $word.Quit() } "
+        "}"
+    )
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        capture_output=True, text=True, timeout=120
+    )
+    if pdf.exists():
+        return str(pdf)
+    raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "PDF conversion failed")
+
+
+def docx_to_pdf_via_libreoffice(docx_path, out_dir):
+    """Convert docx -> pdf using LibreOffice."""
     result = subprocess.run(
         ["soffice", "--headless", "--convert-to", "pdf", "--outdir", str(out_dir), str(docx_path)],
         capture_output=True, text=True, timeout=60
