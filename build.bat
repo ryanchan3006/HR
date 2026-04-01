@@ -48,13 +48,22 @@ if errorlevel 1 goto :fail
 
 echo.
 echo [3/5] Building application folder...
+set "PYI_WORK=%TEMP%\ContractGenerator-pyinstaller\work"
+set "PYI_SPEC=%TEMP%\ContractGenerator-pyinstaller\spec"
+set "TEMPLATE_PATH=%CD%\Workflow Automation template.docx"
+if exist "%PYI_WORK%" rmdir /s /q "%PYI_WORK%"
+if exist "%PYI_SPEC%" rmdir /s /q "%PYI_SPEC%"
+
 ".venv\Scripts\python.exe" -m PyInstaller ^
   --noconfirm ^
   --clean ^
+  --distpath "dist" ^
+  --workpath "%PYI_WORK%" ^
+  --specpath "%PYI_SPEC%" ^
   --onedir ^
   --windowed ^
   --name "ContractGenerator" ^
-  --add-data "Workflow Automation template.docx;." ^
+  --add-data "%TEMPLATE_PATH%;." ^
   app.py
 if errorlevel 1 goto :fail
 
